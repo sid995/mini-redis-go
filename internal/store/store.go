@@ -3,38 +3,61 @@ package store
 import (
 	"hash/fnv"
 	"sync"
+	"time"
 )
+
+// entry represents a key-value pair in the store with an optional expiration time
+// it is used to store the value and the expiration time for a key
+type entry struct {
+	value   []byte
+	expires int64
+}
 
 // shard represents a single shard in the sharded store
 // each shard has its own map and mutex, allowing for concurrent operations
 // on different shards without blocking each other
 type shard struct {
-	mu   sync.RWMutex
-	data map[string][]byte
+	// mu is a read-write mutex that protects the data map
+	mu sync.RWMutex
+	// data is a map of string keys to entries, with expiration times
+	data map[string]*entry
 }
 
-// Store is a sharded in-memory key-value store that maps string keys to bye slice values
-// The store divided into multiple shards, each with their own mutex, providing better
-// concurrency. Allows parallel operations on different shards
+// Store is a sharded in-memory key-value store that maps string keys to byte slice values.
+// The store is divided into multiple shards, each with its own mutex, providing better
+// concurrency. It also supports TTL (Time To Live) with automatic expiration via a background janitor.
 type Store struct {
-	shards     []*shard
+	// shards is an array of shard instances, each managing a portion of the key space
+	shards []*shard
+	// shardCount is the number of shards, used for modulo operation to determine the shard index
 	shardCount int
+	// stop is a channel used to signal the background janitor goroutine to stop
+	stop chan struct{}
+	// wg is used to wait for the janitor goroutine to finish during shutdown
+	wg sync.WaitGroup
+	// janitorinterval is the interval at which the janitor runs to clean uop expired keys
+	janitorInterval time.Duration
 }
 
-// NewStore creates and returns a new instance of Store with default number of shards(256)
-// The default shard count provides a goood balance between concurrency and memory overhead
+// NewStore creates and returns a new instance of Store with the default number of shards (256).
+// The default shard count provides a good balance between concurrency and memory overhead.
+// The janitor runs every 1 second by default to clean up expired keys.
+//
+// Returns:
+//   - *Store: A new Store instance with the default number of shards (256)
 func NewStore() *Store {
 	return NewStoreWithShards(256)
 }
 
-// NewStoreWithShards creates and returns a new instance of Store with a specified number of shards
-// More shards provide better concurrency but use more memory. Typical values are of power of 2 (16, 32, 64, 128, 256)
+// NewStoreWithShards creates and returns a new instance of Store with a specified number of shards.
+// More shards provide better concurrency but use more memory. Typical values are powers of 2 (16, 32, 64, 128, 256).
+// The janitor runs every 1 second by default to clean up expired keys.
 //
 // Parameters:
 //   - shardCount: The number of shards to create. Must be greater than 0. Default is 256.
 //
 // Returns:
-//   - *Store: A new Store instance with the specific number of shards
+//   - *Store: A new Store instance with the specified number of shards
 func NewStoreWithShards(shardCount int) *Store {
 	if shardCount <= 0 {
 		shardCount = 256
@@ -43,13 +66,102 @@ func NewStoreWithShards(shardCount int) *Store {
 	shards := make([]*shard, shardCount)
 	for i := range shards {
 		shards[i] = &shard{
-			data: make(map[string][]byte),
+			data: make(map[string]*entry),
 		}
 	}
 
-	return &Store{
-		shards:     shards,
-		shardCount: shardCount,
+	s := &Store{
+		shards:          shards,
+		shardCount:      shardCount,
+		stop:            make(chan struct{}),
+		janitorInterval: time.Second,
+	}
+	// Start the background janitor goroutine to clean up expired keys
+	s.wg.Add(1)
+	go s.janitor()
+
+	return s
+}
+
+// NewStoreWithJanitorInterval creates a new Store with a custom janitor interval.
+// This allows fine-tuning the frequency of expired key cleanup.
+//
+// Parameters:
+//   - shardCount: The number of shards to create
+//   - interval: The interval at which the janitor should run to clean up expired keys
+//
+// Returns:
+//   - *Store: A new Store instance with the specified configuration
+func NewStoreWithJanitorInterval(shardCount int, interval time.Duration) *Store {
+	if shardCount <= 0 {
+		shardCount = 256
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	shards := make([]*shard, shardCount)
+	for i := range shards {
+		shards[i] = &shard{
+			data: make(map[string]*entry),
+		}
+	}
+
+	s := &Store{
+		shards:          shards,
+		shardCount:      shardCount,
+		stop:            make(chan struct{}),
+		janitorInterval: interval,
+	}
+
+	// Start the background janitor goroutine to clean up expired keys
+	s.wg.Add(1)
+	go s.janitor()
+
+	return s
+}
+
+// Close stops the background janitor goroutine and waits for it to finish.
+// This should be called when the Store is no longer needed to prevent goroutine leaks.
+func (s *Store) Close() {
+	close(s.stop)
+	s.wg.Wait()
+}
+
+// janitor is a background goroutine that periodically scans all shards and removes expired keys.
+// It runs at the interval specified by janitorInterval and stops when the stop channel is closed.
+func (s *Store) janitor() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(s.janitorInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stop:
+			// stop signal received, exit goroutine
+			return
+		case <-ticker.C:
+			// ticker fired, time to clean up expired keys
+			s.cleanupExpired()
+		}
+	}
+}
+
+// cleanupExpired scans all shards and removes keys that have expired.
+// This is called periodically by the janitor goroutine.
+func (s *Store) cleanupExpired() {
+	now := time.Now().UnixNano()
+
+	// Iterate through all shards and clean up expired keys
+	for _, shard := range s.shards {
+		shard.mu.Lock()
+		for key, entry := range shard.data {
+			// check if the key has expired (expires > 0 means it has a TTL and expires < now means it has expired)
+			if entry.expires > 0 && entry.expires < now {
+				delete(shard.data, key)
+			}
+		}
+		shard.mu.Unlock()
 	}
 }
 
@@ -70,27 +182,64 @@ func (s *Store) getShard(key string) *shard {
 	return s.shards[shardIndex]
 }
 
+// isExpired checks if an entry has expired based on the current time.
+//
+// Parameters:
+//   - entry: The entry to check for expiration
+//
+// Returns:
+//   - bool: true if the entry has expired, false otherwise
+func (s *Store) isExpired(entry *entry) bool {
+	if entry == nil {
+		return true
+	}
+	// A value of 0 means the key never expires
+	if entry.expires == 0 {
+		return false
+	}
+
+	// check if the expiration timestamp is in the past
+	return entry.expires < time.Now().UnixNano()
+}
+
 // Get retrieves the value associated with the given key.
-// It returns the value as a byte slice and a boolean indicating whether the key exists.
-// If the key doesn't exist, it returns nil and false.
+// It returns the value as a byte slice and a boolean indicating whether the key exists and is not expired.
+// If the key doesn't exist or has expired, it returns nil and false.
 // This operation uses a read lock on the appropriate shard, allowing concurrent reads.
 //
 // Parameters:
 //   - key: The string key to look up in the store
 //
 // Returns:
-//   - []byte: The value associated with the key, or nil if the key doesn't exist
-//   - bool: true if the key exists, false otherwise
+//   - []byte: The value associated with the key, or nil if the key doesn't exist or has expired
+//   - bool: true if the key exists and is not expired, false otherwise
 func (s *Store) Get(key string) ([]byte, bool) {
 	shard := s.getShard(key)
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
-	value, exists := shard.data[key]
-	return value, exists
+
+	entry, exists := shard.data[key]
+	if !exists {
+		return nil, false
+	}
+
+	// Check if the key has expired
+	if s.isExpired(entry) {
+		// Key has expired, but we can't delete it here because we only have a read lock.
+		// The janitor will clean it up, or it will be deleted on the next write operation.
+		// For now, return as if the key doesn't exist.
+		return nil, false
+	}
+
+	// Copy the value to avoid returning a reference to the internal slice
+	value := make([]byte, len(entry.value))
+	copy(value, entry.value)
+	return value, true
 }
 
 // Set stores a key-value pair in the store.
 // If the key already exists, its value will be overwritten with the new value.
+// Setting a key removes any existing TTL (the key will not expire unless EXPIRE is called).
 // This operation uses a write lock on the appropriate shard, blocking other writes
 // to the same shard but allowing concurrent operations on different shards.
 //
@@ -103,8 +252,12 @@ func (s *Store) Set(key string, value []byte) {
 	defer shard.mu.Unlock() // Release lock after operation
 
 	// Copy the value to avoid modifying the original slice
-	// shard.data[key] = append([]byte{}, value...)
-	shard.data[key] = value
+	valueCopy := make([]byte, len(value))
+	copy(valueCopy, value)
+	shard.data[key] = &entry{
+		value:   valueCopy,
+		expires: 0, // No expiration by default
+	}
 }
 
 // Del removes a key-value pair from the store.
@@ -122,4 +275,79 @@ func (s *Store) Del(key string) {
 	if exists {
 		delete(shard.data, key)
 	}
+}
+
+// Expire sets a time-to-live (TTL) for a key in seconds.
+// If the key doesn't exist, it returns false.
+// If the key exists, it sets the expiration time and returns true.
+// Setting a TTL of 0 or negative will remove the TTL (key will never expire).
+//
+// Parameters:
+//   - key: The string key to set TTL for
+//   - seconds: The number of seconds until the key expires. 0 or negative removes TTL.
+//
+// Returns:
+//   - bool: true if the key exists and TTL was set, false if the key doesn't exist
+func (s *Store) Expire(key string, seconds int64) bool {
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	entry, exists := shard.data[key]
+	if !exists {
+		return false
+	}
+
+	// If seconds is 0 or negative, remove TTL
+	if seconds <= 0 {
+		entry.expires = 0
+		return true
+	}
+
+	// calculate the expiration timestamp: current time + seconds in nanoseconds
+	entry.expires = time.Now().UnixNano() + (seconds * int64(time.Second))
+	return true
+}
+
+// TTL returns the remaining time-to-live of a key in seconds.
+// It returns:
+//   - A positive integer: the number of seconds until the key expires
+//   - -1: if the key exists but has no TTL (never expires)
+//   - -2: if the key doesn't exist
+//
+// Parameters:
+//   - key: The string key to check TTL for
+//
+// Returns:
+//   - int64: The remaining TTL in seconds, -1 if no TTL, or -2 if key doesn't exist
+func (s *Store) TTL(key string) int64 {
+	shard := s.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	entry, exists := shard.data[key]
+	if !exists {
+		return -2 // Key doesn't exist
+	}
+
+	// If expires is 0, the key has no TTL
+	if entry.expires == 0 {
+		return -1 // Key exists but has no TTL
+	}
+
+	// Calculate remaining time
+	now := time.Now().UnixNano()
+	remaining := entry.expires - now
+
+	// If already expired, return 0
+	if remaining <= 0 {
+		return 0
+	}
+
+	remainingSeconds := remaining / int64(time.Second)
+	if remaining%int64(time.Second) > 0 {
+		remainingSeconds++
+	}
+
+	return remainingSeconds
 }
