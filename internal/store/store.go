@@ -103,7 +103,8 @@ func (s *Store) Set(key string, value []byte) {
 	defer shard.mu.Unlock() // Release lock after operation
 
 	// Copy the value to avoid modifying the original slice
-	shard.data[key] = append([]byte{}, value...)
+	// shard.data[key] = append([]byte{}, value...)
+	shard.data[key] = value
 }
 
 // Del removes a key-value pair from the store.
