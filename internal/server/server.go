@@ -34,6 +34,18 @@ type Config struct {
 	WriteTimeout   time.Duration // WriteTimeout is the timeout for writing to connections
 	// PersistenceConfig is the configuration for persistence
 	PersistenceConfig *aof.PersistenceConfig
+	// EvictionConfig holds configuration for LRU eviction
+	EvictionConfig *EvictionConfig
+}
+
+// EvictionConfig holds configuration for LRU eviction
+type EvictionConfig struct {
+	// MaxKeys is the maximum number of keys before eviction (0 = unlimited)
+	MaxKeys int64
+	// MaxMemory is the maximum memory in bytes before eviction (0 = unlimited)
+	MaxMemory int64
+	// EnableEviction enables LRU eviction
+	EnableEviction bool
 }
 
 // DefaultConfig returns a default server configuration
@@ -46,14 +58,33 @@ func DefaultConfig() *Config {
 	}
 }
 
+// DefaultEvictionConfig returns a default eviction configuration with eviction disabled
+func DefaultEvictionConfig() *EvictionConfig {
+	return &EvictionConfig{
+		MaxKeys:        0,
+		MaxMemory:      0,
+		EnableEviction: false,
+	}
+}
+
 // NewServer creates a new server instance with the given confuration
 func NewServer(config *Config) (*Server, error) {
 	if config == nil {
 		config = DefaultConfig()
 	}
 
-	// Create the store
-	s := store.NewStore()
+	// Create the store with or without eviction
+	var s *store.Store
+
+	if config.EvictionConfig != nil && config.EvictionConfig.EnableEviction {
+		s = store.NewStoreWithEviction(
+			256, // shard count
+			config.EvictionConfig.MaxKeys,
+			config.EvictionConfig.MaxMemory,
+		)
+	} else {
+		s = store.NewStore()
+	}
 
 	// create the command handler
 	handler := commands.NewHandler(s)
