@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+// EntrySnapshot represents a serializable entry for snapshots
+type EntrySnapshot struct {
+	Value   []byte
+	Expires int64
+}
+
 // entry represents a key-value pair in the store with an optional expiration time
 // it is used to store the value and the expiration time for a key
 type entry struct {
@@ -350,4 +356,39 @@ func (s *Store) TTL(key string) int64 {
 	}
 
 	return remainingSeconds
+}
+
+// GetAllEntries returns all entries in the store for snapshotting
+// This is used for creating snapshots of the entire store state
+func (s *Store) GetAllEntries() map[string]EntrySnapshot {
+	result := make(map[string]EntrySnapshot)
+
+	for _, shard := range s.shards {
+		shard.mu.RLock()
+		for key, entry := range shard.data {
+			// Only include non-expired entries
+			if entry.expires == 0 || entry.expires > time.Now().UnixNano() {
+				result[key] = EntrySnapshot{
+					Value:   append([]byte{}, entry.value...), // Copy the value
+					Expires: entry.expires,
+				}
+			}
+		}
+
+		shard.mu.RUnlock()
+	}
+	return result
+}
+
+// LoadFromSnapshot loads entries from a snapshot into the store
+func (s *Store) LoadFromSnapshot(entries map[string]EntrySnapshot) {
+	for key, snapEntry := range entries {
+		shard := s.getShard(key)
+		shard.mu.Lock()
+		shard.data[key] = &entry{
+			value:   append([]byte{}, snapEntry.Value...), // Copy the value
+			expires: snapEntry.Expires,
+		}
+		shard.mu.Unlock()
+	}
 }

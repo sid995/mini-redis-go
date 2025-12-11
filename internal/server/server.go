@@ -10,6 +10,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/sid995/mini-redis/internal/aof"
 	"github.com/sid995/mini-redis/internal/commands"
 	"github.com/sid995/mini-redis/internal/resp"
 	"github.com/sid995/mini-redis/internal/store"
@@ -19,6 +20,7 @@ type Server struct {
 	store          *store.Store
 	handler        *commands.Handler
 	listener       net.Listener
+	persistence    *aof.PersistenceManager
 	requestTimeout time.Duration // requestTimeout is the timeout for each request
 	readTimeout    time.Duration // readTimeout is the timeout for reading from the connection
 	writeTimeout   time.Duration // writeTimeout is the timeout for writing to the connection
@@ -30,6 +32,8 @@ type Config struct {
 	RequestTimeout time.Duration // RequestTimeout is the ttimeout for processing each request
 	ReadTimeout    time.Duration // ReadTimeout is the timeout for reading from connections
 	WriteTimeout   time.Duration // WriteTimeout is the timeout for writing to connections
+	// PersistenceConfig is the configuration for persistence
+	PersistenceConfig *aof.PersistenceConfig
 }
 
 // DefaultConfig returns a default server configuration
@@ -53,6 +57,26 @@ func NewServer(config *Config) (*Server, error) {
 
 	// create the command handler
 	handler := commands.NewHandler(s)
+
+	// Create persistence manager
+	var persistence *aof.PersistenceManager
+	if config.PersistenceConfig != nil {
+		var err error
+		persistence, err = aof.NewPersistenceManager(s, handler, config.PersistenceConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create persistence manager: %w", err)
+		}
+
+		// Recover from snapshot andd AOF
+		if err := persistence.Recover(); err != nil {
+			log.Printf("Warning: recovery failed: %v", err)
+		}
+
+		// Set AOF writer in handler
+		if persistence.GetAOFWriter() != nil {
+			handler.SetAOF(persistence.GetAOFWriter())
+		}
+	}
 
 	// create the listener
 	listener, err := net.Listen("tcp", config.Address)
@@ -98,6 +122,16 @@ func (s *Server) Stop() error {
 	// Close the listener to stop accepting new connections
 	if err := s.listener.Close(); err != nil {
 		return err
+	}
+
+	// Write final snapshot before closing
+	if s.persistence != nil {
+		if err := s.persistence.WriteSnapshot(); err != nil {
+			log.Printf("Warning: failed to write final snapshot: %v", err)
+		}
+		if err := s.persistence.Close(); err != nil {
+			log.Printf("Warning: failed to close persistence manager: %v", err)
+		}
 	}
 
 	// Close the store (Stops the janitor goroutine)

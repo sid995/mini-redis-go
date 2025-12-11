@@ -4,19 +4,76 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/sid995/mini-redis/internal/resp"
 	"github.com/sid995/mini-redis/internal/store"
 )
 
 // Handler handles Redis like commands and executes them against the store
 type Handler struct {
 	store *store.Store
+	aof   AOFWriter
+}
+
+// AOFWriter is an interface for writing commands to AOF
+type AOFWriter interface {
+	WriteCommand(command []byte) error
 }
 
 // NewHandler creates a new command handler with the given store
 func NewHandler(s *store.Store) *Handler {
 	return &Handler{
 		store: s,
+		aof:   nil, // No AOF by default
 	}
+}
+
+// NewHandlerWithAOF creates a new command handler with AOF support
+func NewHandlerWithAOF(s *store.Store, aof AOFWriter) *Handler {
+	return &Handler{
+		store: s,
+		aof:   aof,
+	}
+}
+
+// SetAOF sets the AOF writer for the handler
+func (h *Handler) SetAOF(aof AOFWriter) {
+	h.aof = aof
+}
+
+// writeCommandToAOF writes a command to AOF if AOF is enabled
+func (h *Handler) writeCommandToAOF(command string, args []string) {
+	if h.aof == nil {
+		return
+	}
+
+	// Serialize command as RESP array
+	val := resp.Value{
+		Type:  resp.Array,
+		Array: make([]resp.Value, 0, len(args)+1),
+	}
+
+	// Add command name
+	val.Array = append(val.Array, resp.Value{
+		Type: resp.BulkString,
+		Str:  command,
+	})
+
+	// Add arguments
+	for _, arg := range args {
+		val.Array = append(val.Array, resp.Value{
+			Type: resp.BulkString,
+			Str:  arg,
+		})
+	}
+
+	// Serialize and write
+	commandBytes, err := resp.Serialize(val)
+	if err != nil {
+		// Log error but don't fail the command
+		return
+	}
+
+	h.aof.WriteCommand(commandBytes)
 }
 
 // Execute executes a command with the given arguments
@@ -78,6 +135,10 @@ func (h *Handler) set(args []string) []byte {
 	key := args[0]
 	value := []byte(args[1])
 	h.store.Set(key, value)
+
+	// Write to AOF
+	h.writeCommandToAOF("SET", args)
+
 	return []byte("+OK\r\n")
 }
 
@@ -98,6 +159,11 @@ func (h *Handler) del(args []string) []byte {
 		}
 	}
 
+	// Write to AOF only if keys were deleted
+	if count > 0 {
+		h.writeCommandToAOF("DEL", args)
+	}
+
 	// return number of keys deleted
 	return []byte(fmt.Sprintf(":%d\r\n", count))
 }
@@ -115,6 +181,12 @@ func (h *Handler) expire(args []string) []byte {
 		return h.error("ERR value is not an integer or out of range")
 	}
 	success := h.store.Expire(key, seconds)
+
+	// Write to AOF if successful
+	if success {
+		h.writeCommandToAOF("EXPIRE", args)
+	}
+
 	if success {
 		return []byte(":1\r\n") // 1 if timeout was set
 	}
